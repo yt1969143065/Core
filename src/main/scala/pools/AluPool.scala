@@ -26,10 +26,12 @@ class AluPool (numEntriesEachInst: Int = 8) extends Module {
   val PoolOutNum = 4   //pool output number, 4 issue out,  not configurable
   val RFReadNum  = 4   //regfile read number, not configurable
   val WakeNum    = 8   //wakeup number, not configurable
+  val LdNum      = 4
   val numEntries = numEntriesEachInst * PoolInNum 
   val numEntriesIn = numEntriesEachInst * 2
   val numEntriesOut = numEntriesEachInst * 4
   val io = IO(new Bundle {
+    val redirect = Input(new Redirect) 
     val poolFull = Output(Bool()) 
     val poolId = Output(Vec(PoolInNum, UInt(log2Up(numEntries).W)))
     val in = Input(Vec(PoolInNum, new MicroOp()))  
@@ -39,13 +41,18 @@ class AluPool (numEntriesEachInst: Int = 8) extends Module {
     val wakeOut = Output(Vec(PoolOutNum, new MicroOp())) 
     val wakeIn = Input(Vec(WakeNum, new MicroOp()))
     val dataIn = Input(Vec(WakeNum, UInt(64.W)))
-    
+    val ldReq = Output(Vec(LdNum, new LdReq()))
+    val ldRsp = Input(Vec(LdNum, new LdRsp))
   })
+
+  //input port
   val in = io.in
   val regRsp = io.regRsp
   val wakeIn = io.wakeIn
   val dataIn = io.dataIn
-
+  val redirect = io.redirect
+  val ldRsp = io.ldRsp
+  //output port
   //reg
   val src1Rdy  = RegInit(0.U(numEntries.W))
   val src1DRdy = RegInit(0.U(numEntries.W))
@@ -95,14 +102,30 @@ class AluPool (numEntriesEachInst: Int = 8) extends Module {
     val inId1 = PoolInNum - 1 - i/numEntriesIn
     val outId0 = i / numEntriesOut * 2
     val outId1 = i / numEntriesOut * 2 + 1
-    validNxt(i) := (valid(i) || in ( inId0).valid && UIntToOH(in ( inId0).pid)(i) || in ( inId1).valid && UIntToOH(in ( inId1).pid)(i)) && !(
-                                out(outId0).valid && UIntToOH(out(outId0).pid)(i) || out(outId1).valid && UIntToOH(out(outId1).pid)(i))
-    isAlNxt(i)  := (isAl(i ) || in ( inId0).isAl  && UIntToOH(in ( inId0).pid)(i) || in ( inId1).isAl  && UIntToOH(in ( inId1).pid)(i)) && !(
-                                out(outId0).isAl  && UIntToOH(out(outId0).pid)(i) || out(outId1).isAl  && UIntToOH(out(outId1).pid)(i))
-    isBrNxt(i)  := (isBr(i ) || in ( inId0).isBr  && UIntToOH(in ( inId0).pid)(i) || in ( inId1).isBr  && UIntToOH(in ( inId1).pid)(i)) && !(
-                                out(outId0).isBr  && UIntToOH(out(outId0).pid)(i) || out(outId1).isBr  && UIntToOH(out(outId1).pid)(i))
-    isLdNxt(i)  := (isLd(i ) || in ( inId0).isLd  && UIntToOH(in ( inId0).pid)(i) || in ( inId1).isLd  && UIntToOH(in ( inId1).pid)(i)) && !(
-                                out(outId0).isLd  && UIntToOH(out(outId0).pid)(i) || out(outId1).isLd  && UIntToOH(out(outId1).pid)(i))
+    validNxt(i) := (valid(i) || 
+                    in ( inId0).valid && UIntToOH(in ( inId0).pid)(i) || 
+                    in ( inId1).valid && UIntToOH(in ( inId1).pid)(i)) && !(
+                    out(outId0).valid && UIntToOH(out(outId0).pid)(i) || 
+                    out(outId1).valid && UIntToOH(out(outId1).pid)(i) ||
+                    redirect.valid && redirect.flushedIid(iid(i)) )
+    isAlNxt(i)  := (isAl(i ) || 
+                    in ( inId0).isAl  && UIntToOH(in ( inId0).pid)(i) || 
+                    in ( inId1).isAl  && UIntToOH(in ( inId1).pid)(i)) && !(
+                    out(outId0).valid && UIntToOH(out(outId0).pid)(i) || 
+                    out(outId1).valid && UIntToOH(out(outId1).pid)(i) ||
+                    redirect.valid && redirect.flushedIid(iid(i)) )
+    isBrNxt(i)  := (isBr(i ) || 
+                    in ( inId0).isBr  && UIntToOH(in ( inId0).pid)(i) || 
+                    in ( inId1).isBr  && UIntToOH(in ( inId1).pid)(i)) && !(
+                    out(outId0).valid && UIntToOH(out(outId0).pid)(i) || 
+                    out(outId1).valid && UIntToOH(out(outId1).pid)(i) ||
+                    redirect.valid && redirect.flushedIid(iid(i)) )
+    isLdNxt(i)  := (isLd(i ) || 
+                    in ( inId0).isLd  && UIntToOH(in ( inId0).pid)(i) || 
+                    in ( inId1).isLd  && UIntToOH(in ( inId1).pid)(i)) && !(
+                    out(outId0).valid && UIntToOH(out(outId0).pid)(i) || 
+                    out(outId1).valid && UIntToOH(out(outId1).pid)(i) ||
+                    redirect.valid && redirect.flushedIid(iid(i)) )
   } 
    
 
@@ -124,7 +147,40 @@ class AluPool (numEntriesEachInst: Int = 8) extends Module {
     }
   } 
    
- 
+  val inSrc1Wakeup = Wire(Vec(PoolInNum, Bool()))
+  val inSrc2Wakeup = Wire(Vec(PoolInNum, Bool()))
+  for (i <- 0 until PoolInNum) {
+    inSrc1Wakeup(i) := (0 until WakeNum).map(wakeIn(_).valid && wakeIn(_).dstAddr === in(i).src1Addr).reduce(_ || _)
+    inSrc2Wakeup(i) := (0 until WakeNum).map(wakeIn(_).valid && wakeIn(_).dstAddr === in(i).src2Addr).reduce(_ || _)
+  }
+
+  for (i <- 0 until numEntries) {
+    val inId0 = i / inumEntriesIn
+    val inId1 = PoolInNum - 1 - i/numEntriesIn
+    val outId0 = i / numEntriesOut * 2
+    val outId1 = i / numEntriesOut * 2 + 1
+    val entrySrc1Wakeup = Wire(Bool())
+    entrySrc1Wakeup := (0 until WakeNum).map(wakeIn(_).valid && wakeIn(_).dstAddr === src1Addr(i)).reduce(_ || _)
+    src1Rdy(i)  := (src1Rdy(i) || 
+                    entrySrc1Wakeup || 
+                    in ( inId0).src1Rdy  && UIntToOH(in ( inId0).pid)(i) || 
+                    inSrc1Wakeup(inId0)  && UIntToOH(in ( inId0).pid)(i) || 
+                    in ( inId1).src1Rdy  && UIntToOH(in ( inId1).pid)(i)) && !(
+                    inSrc1Wakeup(inId1)  && UIntToOH(in ( inId1).pid)(i) || 
+                    out(outId0).valid  && UIntToOH(out(outId0).pid)(i) || 
+                    out(outId1).valid  && UIntToOH(out(outId1).pid)(i) ||
+                    redirect.valid && redirect.flushedIid(iid(i)) )
+    val entrySrc2Wakeup = Wire(Bool())
+    entrySrc2Wakeup := (0 until WakeNum).map(wakeIn(_).valid && wakeIn(_).dstAddr === src2Addr(i)).reduce(_ || _)
+    src2Rdy(i)  := (src2Rdy(i) || 
+                    entrySrc2Wakeup || 
+                    in ( inId0).src2Rdy  && UIntToOH(in ( inId0).pid)(i) || 
+                    inSrc2Wakeup(inId0)  && UIntToOH(in ( inId0).pid)(i) || 
+                    in ( inId1).src2Rdy  && UIntToOH(in ( inId1).pid)(i)) && !(
+                    inSrc2Wakeup(inId1)  && UIntToOH(in ( inId1).pid)(i) || 
+                    out(outId0).valid  && UIntToOH(out(outId0).pid)(i) || 
+                    out(outId1).valid  && UIntToOH(out(outId1).pid)(i) ||
+                    redirect.valid && redirect.flushedIid(iid(i)) )
 
   
 }
